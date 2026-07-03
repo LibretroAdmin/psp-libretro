@@ -14,7 +14,6 @@
 
 #define NATIVEWIDTH  480
 #define NATIVEHEIGHT 272
-#define SOFT_BMP_SIZE NATIVEWIDTH * NATIVEHEIGHT * 4
 
 class LibretroGraphicsContext : public GraphicsContext {
 public:
@@ -73,22 +72,38 @@ public:
 	LibretroSoftwareContext() {}
 	bool Init() override { return true; }
 	void SwapBuffers() override {
-		GPUDebugBuffer buf;
-		u16 w = NATIVEWIDTH;
-		u16 h = NATIVEHEIGHT;
-		if (gpu) {
-			gpu->GetOutputFramebuffer(buf);
-			const std::vector<u32> pixels = TranslateDebugBufferToCompare(&buf, w, h);
-			memcpy(soft_bmp, pixels.data(), SOFT_BMP_SIZE);
+		u32 w = NATIVEWIDTH;
+		u32 h = NATIVEHEIGHT;
+		if (!gpu) {
+			// Nothing has been rendered yet. Tell the frontend to
+			// duplicate the previous frame instead of scanning out
+			// uninitialized data.
+			video_cb(NULL, w, h, w * sizeof(u32));
+			return;
 		}
-		u32 offset = g_Config.bDisplayCropTo16x9 ? w << 1 : 0;
-		h -= g_Config.bDisplayCropTo16x9 ? 2 : 0;
-		video_cb(soft_bmp + offset, w, h, w << 2);
-    }
+		GPUDebugBuffer buf;
+		gpu->GetOutputFramebuffer(buf);
+		// TranslateDebugBufferToCompare already produces a tightly packed
+		// XRGB8888 buffer we can hand to the frontend directly; video_cb is
+		// synchronous, so the vector's lifetime is sufficient.
+		const std::vector<u32> pixels = TranslateDebugBufferToCompare(&buf, w, h);
+		if (pixels.size() < (size_t)w * h) {
+			// Unknown/unsupported debug buffer format - conversion bailed.
+			// (The previous code memcpy'd a full frame from the empty
+			// vector here: a heap out-of-bounds read.)
+			video_cb(NULL, w, h, w * sizeof(u32));
+			return;
+		}
+		const u32 *data = pixels.data();
+		if (g_Config.bDisplayCropTo16x9) {
+			// Crop 480x272 to 480x270 (16:9): skip the first row, drop the last.
+			data += w;
+			h -= 2;
+		}
+		video_cb(data, w, h, w * sizeof(u32));
+	}
 	GPUCore GetGPUCore() override { return GPUCORE_SOFTWARE; }
 	const char *Ident() override { return "Software"; }
-
-	u16 soft_bmp[SOFT_BMP_SIZE] = {0};
 };
 
 namespace Libretro {
