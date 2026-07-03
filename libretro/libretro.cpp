@@ -67,7 +67,11 @@
 
 #define SAMPLERATE 44100
 
-/* AUDIO output buffer */
+/* AUDIO output buffer.
+ * Written by the emulation thread (System_AudioPushSamples) and drained by
+ * the frontend thread (upload_output_audio_buffer) when the GL EmuThread is
+ * in use, so all access must hold output_audio_mutex. */
+static std::mutex output_audio_mutex;
 static struct {
    int16_t *data;
    int32_t size;
@@ -123,19 +127,30 @@ namespace Libretro
    static float runSpeed = 0.0f;
    static s64 runTicksLast = 0;
 
-   static void ensure_output_audio_buffer_capacity(int32_t capacity)
+   // Must be called with output_audio_mutex held.
+   static bool ensure_output_audio_buffer_capacity(int32_t capacity)
    {
       if (capacity <= output_audio_buffer.capacity) {
-         return;
+         return true;
       }
 
-      output_audio_buffer.data = (int16_t*)realloc(output_audio_buffer.data, capacity * sizeof(*output_audio_buffer.data));
+      int16_t *data = (int16_t*)realloc(output_audio_buffer.data, capacity * sizeof(*output_audio_buffer.data));
+      if (!data) {
+         // Keep the old buffer; drop the new samples instead of crashing.
+         if (log_cb)
+            log_cb(RETRO_LOG_ERROR, "Failed to grow output audio buffer to %d samples\n", capacity);
+         return false;
+      }
+      output_audio_buffer.data = data;
       output_audio_buffer.capacity = capacity;
-      log_cb(RETRO_LOG_DEBUG, "Output audio buffer capacity set to %d\n", capacity);
+      if (log_cb)
+         log_cb(RETRO_LOG_DEBUG, "Output audio buffer capacity set to %d\n", capacity);
+      return true;
    }
 
    static void init_output_audio_buffer(int32_t capacity)
    {
+      std::lock_guard<std::mutex> lock(output_audio_mutex);
       output_audio_buffer.data = NULL;
       output_audio_buffer.size = 0;
       output_audio_buffer.capacity = 0;
@@ -144,6 +159,7 @@ namespace Libretro
 
    static void free_output_audio_buffer()
    {
+      std::lock_guard<std::mutex> lock(output_audio_mutex);
       free(output_audio_buffer.data);
       output_audio_buffer.data = NULL;
       output_audio_buffer.size = 0;
@@ -152,7 +168,9 @@ namespace Libretro
 
    static void upload_output_audio_buffer()
    {
-      audio_batch_cb(output_audio_buffer.data, output_audio_buffer.size / 2);
+      std::lock_guard<std::mutex> lock(output_audio_mutex);
+      if (output_audio_buffer.data && output_audio_buffer.size > 0)
+         audio_batch_cb(output_audio_buffer.data, output_audio_buffer.size / 2);
       output_audio_buffer.size = 0;
    }
 
@@ -1385,17 +1403,21 @@ namespace Libretro
 
       for (;;)
       {
-         switch ((EmuThreadState)emuThreadState)
+         EmuThreadState state = emuThreadState;
+         switch (state)
          {
             case EmuThreadState::START_REQUESTED:
-               emuThreadState = EmuThreadState::RUNNING;
-               [[fallthrough]];
+               // CAS so a concurrent PAUSE_REQUESTED/QUIT_REQUESTED from the
+               // frontend thread is not clobbered by a blind store; loop
+               // re-reads the state either way.
+               emuThreadState.compare_exchange_strong(state, EmuThreadState::RUNNING);
+               break;
             case EmuThreadState::RUNNING:
                EmuFrame();
                break;
             case EmuThreadState::PAUSE_REQUESTED:
-               emuThreadState = EmuThreadState::PAUSED;
-               [[fallthrough]];
+               emuThreadState.compare_exchange_strong(state, EmuThreadState::PAUSED);
+               break;
             case EmuThreadState::PAUSED:
                sleep_ms(1, "libretro-paused");
                break;
@@ -1426,10 +1448,17 @@ namespace Libretro
 
    void EmuThreadStop()
    {
-      if (emuThreadState != EmuThreadState::RUNNING)
+      // The thread must be stopped and joined from *any* live state
+      // (RUNNING, START_REQUESTED, PAUSE_REQUESTED, PAUSED). The old check
+      // for RUNNING only meant that unloading a game while the thread was
+      // paused (e.g. after retro_serialize_size()) left a live thread
+      // behind while ctx was deleted, and left a joinable std::thread at
+      // core unload.
+      if (!emuThread.joinable())
          return;
 
-      emuThreadState = EmuThreadState::QUIT_REQUESTED;
+      if (emuThreadState != EmuThreadState::STOPPED)
+         emuThreadState = EmuThreadState::QUIT_REQUESTED;
 
       // Need to keep eating frames to allow the EmuThread to exit correctly.
       ctx->ThreadFrameUntilCondition([]() -> bool {
@@ -1437,22 +1466,28 @@ namespace Libretro
       });
 
       emuThread.join();
-      emuThread = std::thread();
       ctx->ThreadEnd();
    }
 
    void EmuThreadPause()
    {
-      if (emuThreadState != EmuThreadState::RUNNING)
+      if (emuThreadState != EmuThreadState::RUNNING &&
+          emuThreadState != EmuThreadState::START_REQUESTED)
          return;
 
       emuThreadState = EmuThreadState::PAUSE_REQUESTED;
 
-      // Is this safe?
-      ctx->ThreadFrame(true); // Eat 1 frame
-
-      while (emuThreadState != EmuThreadState::PAUSED)
-         sleep_ms(1, "libretro-pause-poll");
+      // Keep draining the render queue (non-blocking) until the emu thread
+      // acknowledges the pause. The old code performed a single *blocking*
+      // ThreadFrame(true) and then spin-waited: that could deadlock either
+      // way - blocking forever on an empty queue if the emu thread had
+      // already paused, or spinning forever if the emu thread was blocked
+      // on frame submission (inflight-frame limit) and needed more than one
+      // frame drained before it could observe PAUSE_REQUESTED.
+      while (emuThreadState != EmuThreadState::PAUSED) {
+         if (!ctx->ThreadFrame(false))
+            sleep_ms(1, "libretro-pause-poll");
+      }
    }
 
 } // namespace Libretro
@@ -1568,6 +1603,12 @@ void retro_unload_game(void)
 
 void retro_reset(void)
 {
+   // The emulation thread must not be running while the PSP core is torn
+   // down, otherwise EmuFrame() races PSP_Shutdown() (use-after-free).
+   // retro_run() will lazily restart it after the re-init below.
+   if (useEmuThread)
+      EmuThreadStop();
+
    PSP_Shutdown(true);
 
    if (BootState::Complete != PSP_Init(PSP_CoreParameter(), &g_bootErrorString))
@@ -1722,10 +1763,16 @@ void retro_run(void)
       retro_reset();
    }
 
-   bool updated;
+   bool updated = false;
    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE_UPDATE, &updated)
       && updated)
+   {
+      // Don't mutate g_Config while the emulation thread may be reading it.
+      // The thread is resumed below.
+      if (useEmuThread && emuThreadState == EmuThreadState::RUNNING)
+         EmuThreadPause();
       check_variables(PSP_CoreParameter());
+   }
    else
       check_dynamic_variables(PSP_CoreParameter());
 
@@ -1733,15 +1780,12 @@ void retro_run(void)
 
    if (useEmuThread)
    {
-      if (  emuThreadState == EmuThreadState::PAUSED ||
-            emuThreadState == EmuThreadState::PAUSE_REQUESTED)
-      {
-         VsyncSwapIntervalDetect();
-         ctx->SwapBuffers();
-         return;
-      }
-
-      if (emuThreadState != EmuThreadState::RUNNING)
+      // This also resumes from PAUSED. Previously retro_run() returned early
+      // while paused and nothing ever restarted the thread, so a frontend
+      // calling retro_serialize_size() without a matching retro_serialize()
+      // (or the config-update pause above) froze emulation permanently.
+      if (emuThreadState != EmuThreadState::RUNNING &&
+          emuThreadState != EmuThreadState::START_REQUESTED)
          EmuThreadStart();
 
       if (!ctx->ThreadFrame(true))
@@ -1793,16 +1837,27 @@ bool retro_serialize(void *data, size_t size)
    if (useEmuThread)
       EmuThreadPause(); // Does nothing if already paused
 
-   size_t measuredSize;
    SaveState::SaveStart state;
-   auto err = CChunkFileReader::MeasureAndSavePtr(state, (u8 **)&data, &measuredSize);
-   bool retVal = err == CChunkFileReader::ERROR_NONE;
+   bool retVal = false;
+
+   // The frontend's buffer was sized from an earlier retro_serialize_size()
+   // call; the state may have grown since. Never write past 'size' - that
+   // corrupts the frontend heap.
+   size_t measuredSize = CChunkFileReader::MeasurePtr(state);
+   if (measuredSize <= size)
+   {
+      u8 *buffer = (u8 *)data;
+      auto err = CChunkFileReader::MeasureAndSavePtr(state, &buffer, &measuredSize);
+      retVal = err == CChunkFileReader::ERROR_NONE;
+   }
+   else
+   {
+      ERROR_LOG(Log::SaveState, "Savestate (%d bytes) does not fit in frontend buffer (%d bytes)",
+                (int)measuredSize, (int)size);
+   }
 
    if (useEmuThread)
-   {
       EmuThreadStart();
-      sleep_ms(4, "libretro-serialize");
-   }
 
    return retVal;
 }
@@ -1812,7 +1867,12 @@ bool retro_unserialize(const void *data, size_t size)
    // The HW renderer isn't ready on first pass.
    // So we save the data until we are ready to use it.
    if (!gpu) {
-      unserialize_data = malloc(size);
+      void *buffer = malloc(size);
+      if (!buffer)
+         return false;
+      free(unserialize_data); // Don't leak a previously deferred state.
+      unserialize_data = buffer;
+      unserialize_size = size;
       memcpy(unserialize_data, data, size);
       return true;
    }
@@ -1827,31 +1887,34 @@ bool retro_unserialize(const void *data, size_t size)
       == CChunkFileReader::ERROR_NONE;
 
    if (useEmuThread)
-   {
       EmuThreadStart();
-      sleep_ms(4, "libretro-unserialize");
-   }
 
    return retVal;
 }
 
 void *retro_get_memory_data(unsigned id)
 {
-   if ( id == RETRO_MEMORY_SYSTEM_RAM )
-      return Memory::GetPointerWriteUnchecked(PSP_GetKernelMemoryBase()) ;
+   // Frontends may call this immediately after retro_load_game(), before the
+   // deferred boot in retro_run() has mapped PSP memory. Returning a pointer
+   // computed from an unmapped base would hand the frontend an invalid
+   // non-NULL pointer (out-of-bounds access on its side).
+   if (id == RETRO_MEMORY_SYSTEM_RAM && Memory::IsActive())
+      return Memory::GetPointerWriteUnchecked(PSP_GetKernelMemoryBase());
    return NULL;
 }
 
 size_t retro_get_memory_size(unsigned id)
 {
-	if ( id == RETRO_MEMORY_SYSTEM_RAM )
-		return Memory::g_MemorySize ;
+	if (id == RETRO_MEMORY_SYSTEM_RAM && Memory::IsActive())
+		return Memory::g_MemorySize;
 	return 0;
 }
 
 void retro_cheat_reset(void) {
-   // Init Cheat Engine
-   CWCheatEngine *cheatEngine = new CWCheatEngine(g_paramSFO.GetDiscID());
+   // Init Cheat Engine (stack allocated - the old 'new' here leaked one
+   // engine per call)
+   CWCheatEngine cheatEngineObj(g_paramSFO.GetDiscID());
+   CWCheatEngine *cheatEngine = &cheatEngineObj;
    Path file=cheatEngine->CheatFilename();
 
    // Output cheats to cheat file
@@ -1872,8 +1935,10 @@ void retro_cheat_reset(void) {
 }
 
 void retro_cheat_set(unsigned index, bool enabled, const char *code) {
-   // Initialize Cheat Engine
-   CWCheatEngine *cheatEngine = new CWCheatEngine(g_paramSFO.GetDiscID());
+   // Initialize Cheat Engine (stack allocated - the old 'new' here leaked
+   // one engine per call)
+   CWCheatEngine cheatEngineObj(g_paramSFO.GetDiscID());
+   CWCheatEngine *cheatEngine = &cheatEngineObj;
    cheatEngine->CreateCheatFile();
    Path file=cheatEngine->CheatFilename();
 
@@ -2022,24 +2087,36 @@ inline int16_t Clamp16(int32_t sample) {
 void System_AudioPushSamples(const int32_t *audio, int numSamples, float volume) {
    // We ignore volume here, because it's handled by libretro presumably.
 
-   // Convert to 16-bit audio for further processing.
+   if (!audio || numSamples <= 0)
+      return;
+
+   // Convert to 16-bit audio for further processing, one block at a time.
+   //
+   // NOTE: The previous implementation never advanced 'audio' between blocks,
+   // overwrote 'buffer' on every iteration, and then copied numSamples * 2
+   // int16s out of a fixed 2048-sample stack buffer - a stack out-of-bounds
+   // read (and garbage audio) for any push larger than 1024 frames.
    int16_t buffer[1024 * 2];
-   int origSamples = numSamples * 2;
+
+   std::lock_guard<std::mutex> lock(output_audio_mutex);
 
    while (numSamples > 0) {
       int blockSize = std::min(1024, numSamples);
-      for (int i = 0; i < blockSize; i++) {
-         buffer[i * 2] = Clamp16(audio[i * 2]);
-         buffer[i * 2 + 1] = Clamp16(audio[i * 2 + 1]);
-      }
+      int blockValues = blockSize * 2; // stereo
 
+      for (int i = 0; i < blockValues; i++)
+         buffer[i] = Clamp16(audio[i]);
+
+      if (output_audio_buffer.capacity - output_audio_buffer.size < blockValues) {
+         if (!ensure_output_audio_buffer_capacity((int32_t)((output_audio_buffer.capacity + blockValues) * 1.5f)))
+            return; // Allocation failed; drop the remaining samples.
+      }
+      memcpy(output_audio_buffer.data + output_audio_buffer.size, buffer, blockValues * sizeof(*output_audio_buffer.data));
+      output_audio_buffer.size += blockValues;
+
+      audio += blockValues;
       numSamples -= blockSize;
    }
-
-   if (output_audio_buffer.capacity - output_audio_buffer.size < origSamples)
-      ensure_output_audio_buffer_capacity((output_audio_buffer.capacity + origSamples) * 1.5);
-   memcpy(output_audio_buffer.data + output_audio_buffer.size, buffer, origSamples * sizeof(*output_audio_buffer.data));
-   output_audio_buffer.size += origSamples;
 }
 
 void System_AudioGetDebugStats(char *buf, size_t bufSize) { if (buf) buf[0] = '\0'; }
