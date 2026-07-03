@@ -204,7 +204,12 @@ static VKAPI_ATTR VkResult VKAPI_CALL vkCreateSwapchainKHR_libretro(VkDevice dev
 		chain.count++;
 		swapchain_mask >>= 1;
 	}
+	// The frontend controls the sync index mask. In release builds (NDEBUG)
+	// the assert below disappears, so an unexpected mask would overflow
+	// chain.images[]; clamp defensively.
 	assert(chain.count <= VULKAN_MAX_SWAPCHAIN_IMAGES);
+	if (chain.count > VULKAN_MAX_SWAPCHAIN_IMAGES)
+		chain.count = VULKAN_MAX_SWAPCHAIN_IMAGES;
 
 	for (uint32_t i = 0; i < chain.count; i++) {
 		{
