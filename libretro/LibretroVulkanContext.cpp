@@ -43,11 +43,19 @@ static bool create_device(retro_vulkan_context *context, VkInstance instance, Vk
 	vk->CreateInstance({});
 
 	int physical_device = 0;
-	while (gpu && vk->GetPhysicalDevice(physical_device) != gpu) {
-		physical_device++;
-	}
-
-	if (!gpu) {
+	if (gpu) {
+		// The frontend can hand us a specific physical device; find its index
+		// without walking past the end of the enumerated list (the old loop
+		// indexed physical_devices_[] out of bounds if the handle was absent).
+		int num_devices = vk->GetNumPhysicalDevices();
+		while (physical_device < num_devices && vk->GetPhysicalDevice(physical_device) != gpu) {
+			physical_device++;
+		}
+		if (physical_device == num_devices) {
+			WARN_LOG(Log::G3D, "Frontend-provided VkPhysicalDevice not found; falling back to best device");
+			physical_device = vk->GetBestPhysicalDevice();
+		}
+	} else {
 		physical_device = vk->GetBestPhysicalDevice();
 	}
 
